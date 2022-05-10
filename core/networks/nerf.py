@@ -12,7 +12,7 @@ import itertools
 class NeRF(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, input_ch_bones=0, input_ch_views=3,
                  output_ch=4, skips=[4], use_viewdirs=False, use_framecode=False,
-                 framecode_ch=16, n_framecodes=0, skel_type=None, density_scale=1.0):
+                 framecode_ch=16, n_framecodes=0, skel_type=None, density_scale=1.0, mode=0):
         """
         idx_maps: for mapping framecode_idx
         """
@@ -37,6 +37,7 @@ class NeRF(nn.Module):
         self.output_ch = output_ch
         self.skel_type = skel_type
         self.density_scale = density_scale
+        self.mode = mode
 
         self.init_density_net()
         self.init_radiance_net()
@@ -58,15 +59,26 @@ class NeRF(nn.Module):
 
         W, D = self.W, self.D
 
-        layers = [nn.Linear(self.dnet_input, W)]
+        # UNeRF Conv
+        if (self.mode == 3):
+            self.pts_linears = nn.ModuleList(
+                [nn.Linear(self.dnet_input, W)] + [nn.Linear(W, W) for i in range(D-1-3)])
+            self.out_1 = []
+            self.out_2 = []
+            self.out_3 = []
+            self.conv1 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
+            self.conv2 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
+            self.conv3 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
+        else:
+            layers = [nn.Linear(self.dnet_input, W)]
 
-        for i in range(D-1):
-            if i not in self.skips:
-                layers += [nn.Linear(W, W)]
-            else:
-                layers += [nn.Linear(W + self.dnet_input, W)]
+            for i in range(D-1):
+                if i not in self.skips:
+                    layers += [nn.Linear(W, W)]
+                else:
+                    layers += [nn.Linear(W + self.dnet_input, W)]
 
-        self.pts_linears = nn.ModuleList(layers)
+            self.pts_linears = nn.ModuleList(layers)
 
         if self.use_viewdirs:
             self.alpha_linear = nn.Linear(W, 1)
@@ -87,18 +99,74 @@ class NeRF(nn.Module):
         if self.use_framecode:
             self.framecodes = Optcodes(self.n_framecodes, self.framecode_ch)
 
-    def forward_batchify(self, inputs, chunk=1024*64, **kwargs):
-        return torch.cat([self.forward(inputs[i:i+chunk], **{k: kwargs[k][i:i+chunk] for k in kwargs})
+    def forward_batchify(self, inputs, chunk=1024*64, rays=2048, **kwargs):
+        return torch.cat([self.forward(inputs[i:i+chunk], rays, **{k: kwargs[k][i:i+chunk] for k in kwargs})
                           for i in range(0, inputs.shape[0], chunk)], -2)
 
-    def forward_density(self, input_pts):
-        h = input_pts
+    def local_interpolation(self, anchor_points, intermediate_points, anchor_values):
+        dist_norm = (intermediate_points - anchor_points)[:-1] / (anchor_points[1:] - anchor_points[:-1])
+        if torch.isnan(dist_norm).any():
+            dist_norm = torch.nan_to_num(dist_norm, nan=0.0)
+        intermediate_values = anchor_values[:-1, :] + ((anchor_values[1:, :] - anchor_values[:-1, :])*dist_norm)
 
-        for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
-            if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+        # last value is lost so we just take the nearest neighbour
+        intermediate_values = torch.cat([intermediate_values, intermediate_values[-1].unsqueeze(0)], dim=0)
+
+        desired_size = torch.Size((anchor_values.shape[0]*2, anchor_values.shape[1]))
+        interpolated = torch.stack((anchor_values, intermediate_values), dim=1).view(torch.Size((desired_size[1], desired_size[0]))).contiguous().view(desired_size)
+                        
+        return interpolated
+
+    def convolve(self, feature_vector, conv, rays):
+        reshaped = feature_vector.view(rays, -1, 256)
+        reshaped = reshaped.permute(0, 2, 1)
+        output = conv(reshaped)
+        output = output.permute(0, 2, 1)
+        return torch.reshape(output, (-1, 256))
+
+    def forward_density(self, input_pts, input_dists, rays):
+        h = input_pts
+        if (self.mode == 3):
+            for i in range(self.D):
+                if (i == 0):
+                    h = self.pts_linears[i](h)
+                    h = F.relu(h)
+                elif (i == 1):
+                    h = self.pts_linears[i](h)
+                    h = F.relu(h)
+                    self.out_1 = h
+                elif (i == 2):
+                    h = self.convolve(h, self.conv1, rays)
+                    h = F.relu(h)
+                    self.out_2 = h
+                elif (i == 3):
+                    h = self.convolve(h, self.conv2, rays)
+                    h = F.relu(h)
+                    self.out_3 = h
+                elif (i == 4):
+                    h = self.convolve(h, self.conv3, rays)
+                    h = F.relu(h)
+                    h = self.local_interpolation(input_dists[::8], input_dists[4::8], h)
+                    h = h + self.out_3
+                elif (i == 5):
+                    h = self.pts_linears[i-3](h)
+                    h = F.relu(h)
+                    h = self.local_interpolation(input_dists[::4], input_dists[2::4], h)
+                    h = h + self.out_2
+                elif (i == 6):
+                    h = self.pts_linears[i-3](h)
+                    h = F.relu(h)
+                    h = self.local_interpolation(input_dists[::2], input_dists[1::2], h)
+                    h = h + self.out_1
+                else:
+                    h = self.pts_linears[i-3](h)
+                    h = F.relu(h)
+        else:
+            for i, l in enumerate(self.pts_linears):
+                h = self.pts_linears[i](h)
+                h = F.relu(h)
+                if i in self.skips:
+                    h = torch.cat([input_pts, h], -1)
         return h
 
     def forward_feature(self, input_pts, input_views):
@@ -130,12 +198,12 @@ class NeRF(nn.Module):
 
         return self.rgb_linear(h)
 
-    def forward(self, x):
+    def forward(self, x, rays):
         # standard NeRF
-        input_pts, input_views, frame_idxs = torch.split(x, [self.input_ch + self.input_ch_bones,
-                                                             self.input_ch_views, self.cam_ch],
+        input_pts, input_views, frame_idxs, input_dists = torch.split(x, [self.input_ch + self.input_ch_bones,
+                                                             self.input_ch_views, self.cam_ch, 1],
                                                          dim=-1)
-        h = self.forward_density(input_pts)
+        h = self.forward_density(input_pts, input_dists, rays)
 
         if self.use_viewdirs:
             # predict density and radiance separately

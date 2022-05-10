@@ -91,7 +91,8 @@ def create_raycaster(args, data_attrs, device=None):
                    'framecode_ch': args.framecode_size,
                    'n_framecodes': n_framecodes,
                    'skel_type': skel_type,
-                   'density_scale': args.density_scale}
+                   'density_scale': args.density_scale,
+                   'mode': args.mode}
 
     model = NeRF(**nerf_kwargs)
 
@@ -431,7 +432,7 @@ class RayCaster(nn.Module):
                                      **preproc_kwargs)
 
         # Step 4: forwarding in NeRF and get coarse outputs
-        raw = self.run_network(encoded, self.network)
+        raw = self.run_network(encoded, self.network, z_vals)
         ret_dict = self.network.raw2outputs(raw, z_vals, rays_d, raw_noise_std, pytest=pytest,
                                             encoded=encoded, B=preproc_kwargs['density_scale'],
                                             act_fn=preproc_kwargs['density_fn'])
@@ -458,9 +459,9 @@ class RayCaster(nn.Module):
                 N_total_samples = N_importance + N_samples
                 encoded_is = self._merge_encodings(encoded, encoded_is, sorted_idxs,
                                                    N_rays, N_total_samples)
-                raw = self.run_network(encoded_is, self.network_fine)
+                raw = self.run_network(encoded_is, self.network_fine, z_vals)
             else:
-                raw_is = self.run_network(encoded_is, self.network_fine)
+                raw_is = self.run_network(encoded_is, self.network_fine, z_vals)
 
                 N_total_samples = N_importance + N_samples
                 encoded_is = self._merge_encodings(encoded, encoded_is, sorted_idxs,
@@ -554,9 +555,7 @@ class RayCaster(nn.Module):
         }
         return encoded
 
-    def run_network(self, encoded, network, netchunk=1024*64):
-
-
+    def run_network(self, encoded, network, z_vals, netchunk=1024*64):
         cat_lists = [encoded['v']]
 
         # has bone encoding
@@ -567,10 +566,11 @@ class RayCaster(nn.Module):
             cat_lists.append(encoded['d'])
 
         encoded = torch.cat(cat_lists, dim=-1)
+        encoded = torch.cat([encoded, z_vals.unsqueeze(-1)], dim=-1)
         shape = encoded.shape
 
         # flatten and forward
-        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=netchunk)
+        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=netchunk, rays=z_vals.shape[0])
         reshape = list(shape[:-1]) + [outputs_flat.shape[-1]]
         outputs = torch.reshape(outputs_flat, reshape)
 

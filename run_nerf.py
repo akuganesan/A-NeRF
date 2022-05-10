@@ -1,4 +1,5 @@
 import os, sys
+import wandb
 import numpy as np
 import time
 import torch
@@ -485,6 +486,18 @@ def config_parser():
     parser.add_argument("--debug", action='store_true',
                         help='debug flag')
 
+    # experimentation flags
+    '''
+        0 NeRF   original NeRF implementation 
+        1 siNeRF segment and interpolate frequency based positional embedding inputs to network
+        2 SUNeRF  NeRF with U-Net architecture with summation with skips
+        3 CUNeRF  NeRF with U-Net architecture with convolutions
+    '''
+    parser.add_argument("--mode", type=int, default=0,
+                        help='experimentation mode as described above')
+    parser.add_argument("--benchmark", action='store_true', 
+                        help='log timing per iteration for forward, backward, and step function')
+
     return parser
 
 
@@ -492,6 +505,31 @@ def train():
 
     parser = config_parser()
     args = parser.parse_args()
+
+    if (args.mode == 0):
+        model_type = "Baseline"
+    elif (args.mode == 1):
+        model_type = "SiNeRF"
+    elif (args.mode == 2):
+        model_type = "UNeRF_sum"
+    elif (args.mode == 3):
+        model_type = "UNeRF_conv"
+
+    wandb_config = dict (
+        model_type = model_type,
+        dataset = args.datadir.split('/')[-1],
+        n_rays = args.N_rand,
+        n_samples = args.N_samples,
+        n_importance = args.N_importance,
+        n_layers = args.netdepth
+    )
+
+    run_name = "{}_rays{}_sam{}_imp{}_lay{}_{}".format(wandb_config["model_type"], wandb_config["n_rays"], wandb_config["n_samples"], wandb_config["n_importance"], wandb_config["n_layers"], wandb_config["dataset"])
+
+    if not args.benchmark:
+        ## Use this if resuming a wandb run
+        # wandb.init(project="UNeRF_anerf", id="oi8rmdo4", resume="must")
+        wandb.init(project="UNeRF_anerf", name=run_name, tags=[model_type], config=wandb_config, entity="akuganesan", settings=wandb.Settings(start_method="fork"))
 
     train_loader, render_data, data_attrs = load_data(args)
     skel_type = data_attrs['skel_type']
@@ -538,7 +576,24 @@ def train():
     for i in trange(start, N_iters):
         time0 = time.time()
         batch = next(train_iter)
-        loss_dict, stats = trainer.train_batch(batch, i, global_step)
+
+        # Memory Benchmarking
+        if args.benchmark:
+            from torch.profiler import profile, record_function, ProfilerActivity
+            with profile(activities=[ProfilerActivity.CUDA], profile_memory=True, record_shapes=True) as prof:
+                #####  Core optimization loop  #####
+                loss_dict, stats = trainer.train_batch(batch, i, global_step)
+            table = prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=1)
+            cuda_memory_usage = prof.key_averages()[0].cuda_memory_usage
+            print(table)
+        else:
+            loss_dict, stats = trainer.train_batch(batch, i, global_step)
+
+        dt = time.time() - time0
+
+        if args.benchmark:
+            mem = torch.cuda.max_memory_allocated() / 1024. / 1024.
+            print("Mem: " , mem)
 
         # Rest is logging
         if i % args.i_weights == 0:
@@ -600,11 +655,14 @@ def train():
                 writer.add_video("Val/Skeleton", torch.tensor(skel_imgs).permute(0, 3, 1, 2)[None], i, fps=fps)
             writer.add_scalar("Val/PSNR", metrics["psnr"], i)
             writer.add_scalar("Val/SSIM", metrics["ssim"], i)
+            wandb.log({'val_psnr': metrics["psnr"]}, step=i)
 
         if i % args.i_print == 0:
             mem = torch.cuda.max_memory_allocated() / 1024. / 1024.
             loss, psnr, alpha, total_norm = loss_dict['total_loss'], stats['psnr'], stats['alpha'], stats['total_norm']
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr}, Alpha: {alpha}, GradNorm {total_norm}, Mem: {mem}")
+            wandb.log({'train_loss': loss.item(), 'train_psnr': psnr, 'iter time': dt, 'Max Mem': mem}, step=i)
+
             for k in loss_dict:
                 if k == 'total_loss':
                     writer.add_scalar(f'Loss/{k}_{args.loss_fn}', loss_dict[k], i)
