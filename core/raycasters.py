@@ -557,7 +557,6 @@ class RayCaster(nn.Module):
 
     def run_network(self, encoded, network, z_vals, netchunk=1024*64):
         cat_lists = [encoded['v']]
-
         # has bone encoding
         if encoded['r'] is not None:
             cat_lists.append(encoded['r'])
@@ -569,8 +568,8 @@ class RayCaster(nn.Module):
         encoded = torch.cat([encoded, z_vals.unsqueeze(-1)], dim=-1)
         shape = encoded.shape
 
-        # flatten and forward
-        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=netchunk, rays=z_vals.shape[0])
+        # flatten and forward #ABI CHANGE THIS CHUNK VAL
+        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=z_vals.shape[0]*z_vals.shape[1], rays=z_vals.shape[0])
         reshape = list(shape[:-1]) + [outputs_flat.shape[-1]]
         outputs = torch.reshape(outputs_flat, reshape)
 
