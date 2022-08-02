@@ -68,14 +68,15 @@ class NeRF(nn.Module):
             self.out_3 = []
         # UNeRF Conv
         elif (self.mode == 3):
+            self.kernel=3
             self.pts_linears = nn.ModuleList(
                 [nn.Linear(self.dnet_input, W)] + [nn.Linear(W, W) for i in range(D-1-3)])
             self.out_1 = []
             self.out_2 = []
             self.out_3 = []
-            self.conv1 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
-            self.conv2 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
-            self.conv3 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=3, stride=2, padding=1)
+            self.conv1 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=self.kernel, stride=2, padding=1)
+            self.conv2 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=self.kernel, stride=2, padding=1)
+            self.conv3 = nn.Conv1d(in_channels=self.W, out_channels=self.W, kernel_size=self.kernel, stride=2, padding=1)
         else:
             layers = [nn.Linear(self.dnet_input, W)]
 
@@ -106,12 +107,12 @@ class NeRF(nn.Module):
         if self.use_framecode:
             self.framecodes = Optcodes(self.n_framecodes, self.framecode_ch)
 
-    def forward_batchify(self, inputs, chunk=1024*64, rays=2048, **kwargs):
-        return torch.cat([self.forward(inputs[i:i+chunk], rays, **{k: kwargs[k][i:i+chunk] for k in kwargs})
+    def forward_batchify(self, inputs, chunk=1024*64, rays=2048, samples=64, **kwargs):
+        return torch.cat([self.forward(inputs[i:i+chunk], rays, samples, **{k: kwargs[k][i:i+chunk] for k in kwargs})
                           for i in range(0, inputs.shape[0], chunk)], -2)
 
     def local_interpolation(self, anchor_points, intermediate_points, anchor_values):
-        dist_norm = (intermediate_points - anchor_points)[:-1] / (anchor_points[1:] - anchor_points[:-1])
+        dist_norm = (intermediate_points - anchor_points)[:-1] / (anchor_points[1:] - anchor_points[:-1] + 1e-8)
         if torch.isnan(dist_norm).any():
             dist_norm = torch.nan_to_num(dist_norm, nan=0.0)
         intermediate_values = anchor_values[:-1, :] + ((anchor_values[1:, :] - anchor_values[:-1, :])*dist_norm)
@@ -124,14 +125,26 @@ class NeRF(nn.Module):
                         
         return interpolated
 
-    def convolve(self, feature_vector, conv, rays):
-        reshaped = feature_vector.view(rays, -1, 256)
+    def convolve(self, feature_vector, conv, rays, samples, val):
+        try:
+            if samples != 80:
+                reshaped = feature_vector.view(-1, int(samples/(2**(val-1))), 256)
+            elif samples == 80:
+                samples=16
+                reshaped = feature_vector.view(-1, int(samples/(2**(val-1))), 256)
+            else:
+                import pdb; pdb.set_trace()
+        except:
+            import pdb; pdb.set_trace()
         reshaped = reshaped.permute(0, 2, 1)
         output = conv(reshaped)
         output = output.permute(0, 2, 1)
+        if self.kernel == 2:
+            output = output[:, :-1, :]
         return torch.reshape(output, (-1, 256))
 
-    def forward_density(self, input_pts, input_dists, rays):
+    def forward_density(self, input_pts, input_dists, rays, samples):
+
         h = input_pts
         if (self.mode == 2):
             for i in range(self.D):
@@ -165,15 +178,15 @@ class NeRF(nn.Module):
                     h = F.relu(h)
                     self.out_1 = h
                 elif (i == 2):
-                    h = self.convolve(h, self.conv1, rays)
+                    h = self.convolve(h, self.conv1, rays, samples, 1)
                     h = F.relu(h)
                     self.out_2 = h
                 elif (i == 3):
-                    h = self.convolve(h, self.conv2, rays)
+                    h = self.convolve(h, self.conv2, rays, samples, 2)
                     h = F.relu(h)
                     self.out_3 = h
                 elif (i == 4):
-                    h = self.convolve(h, self.conv3, rays)
+                    h = self.convolve(h, self.conv3, rays, samples, 3)
                     h = F.relu(h)
                     h = self.local_interpolation(input_dists[::8], input_dists[4::8], h)
                     h = h + self.out_3
@@ -196,6 +209,8 @@ class NeRF(nn.Module):
                 h = F.relu(h)
                 if i in self.skips:
                     h = torch.cat([input_pts, h], -1)
+        if h.isnan().any():
+            import pdb; pdb.set_trace()
         return h
 
     def forward_feature(self, input_pts, input_views):
@@ -227,12 +242,12 @@ class NeRF(nn.Module):
 
         return self.rgb_linear(h)
 
-    def forward(self, x, rays):
+    def forward(self, x, rays, samples):
         # standard NeRF
         input_pts, input_views, frame_idxs, input_dists = torch.split(x, [self.input_ch + self.input_ch_bones,
                                                              self.input_ch_views, self.cam_ch, 1],
                                                          dim=-1)
-        h = self.forward_density(input_pts, input_dists, rays)
+        h = self.forward_density(input_pts, input_dists, rays, samples)
 
         if self.use_viewdirs:
             # predict density and radiance separately
@@ -287,10 +302,17 @@ class NeRF(nn.Module):
         # T_i = exp(sum_{j=1 to i-1} -sigma_j * delta_j) = torch.cumprod(1 - alpha_i)
         # standard NeRF
         weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+
         rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+
+        if rgb_map.isnan().any():
+            import pdb; pdb.set_trace()
 
         depth_map = torch.sum(weights * z_vals, -1)
         disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / (torch.sum(weights, -1)  + 1e-10))
+
+        if disp_map.isnan().any():
+            import pdb; pdb.set_trace()
 
         invalid_mask = torch.ones_like(disp_map)
         invalid_mask[torch.isclose(weights.sum(-1), torch.tensor(0.))] = 0.

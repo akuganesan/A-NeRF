@@ -251,6 +251,9 @@ class Trainer:
         loss_dict, stats = self.compute_loss(batch, preds, kp_opts={**kp_args, **extra_args},
                                              popt_detach=popt_detach or not args.opt_pose)
 
+        if loss_dict['total_loss'].isnan():
+            import pdb; pdb.set_trace()
+
         optim_stats = self.optimize(loss_dict['total_loss'], i, popt_detach or not args.opt_pose)
 
         # step 4: rate decay

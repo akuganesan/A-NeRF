@@ -513,7 +513,7 @@ def train():
     elif (args.mode == 2):
         model_type = "UNeRF_sum"
     elif (args.mode == 3):
-        model_type = "UNeRF_conv"
+        model_type = "UNeRF_convk2"
 
     wandb_config = dict (
         model_type = model_type,

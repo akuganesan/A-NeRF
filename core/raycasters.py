@@ -432,7 +432,7 @@ class RayCaster(nn.Module):
                                      **preproc_kwargs)
 
         # Step 4: forwarding in NeRF and get coarse outputs
-        raw = self.run_network(encoded, self.network, z_vals)
+        raw = self.run_network(encoded, self.network, z_vals, N_samples)
         ret_dict = self.network.raw2outputs(raw, z_vals, rays_d, raw_noise_std, pytest=pytest,
                                             encoded=encoded, B=preproc_kwargs['density_scale'],
                                             act_fn=preproc_kwargs['density_fn'])
@@ -459,9 +459,9 @@ class RayCaster(nn.Module):
                 N_total_samples = N_importance + N_samples
                 encoded_is = self._merge_encodings(encoded, encoded_is, sorted_idxs,
                                                    N_rays, N_total_samples)
-                raw = self.run_network(encoded_is, self.network_fine, z_vals)
+                raw = self.run_network(encoded_is, self.network_fine, z_vals, N_total_samples)
             else:
-                raw_is = self.run_network(encoded_is, self.network_fine, z_vals)
+                raw_is = self.run_network(encoded_is, self.network_fine, z_vals, N_importance)
 
                 N_total_samples = N_importance + N_samples
                 encoded_is = self._merge_encodings(encoded, encoded_is, sorted_idxs,
@@ -570,7 +570,7 @@ class RayCaster(nn.Module):
         shape = encoded.shape
 
         # flatten and forward
-        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=netchunk, rays=z_vals.shape[0])
+        outputs_flat = network.forward_batchify(encoded.reshape(-1, shape[-1]), chunk=netchunk, rays=z_vals.shape[0], samples=z_vals.shape[1])
         reshape = list(shape[:-1]) + [outputs_flat.shape[-1]]
         outputs = torch.reshape(outputs_flat, reshape)
 
